@@ -77,19 +77,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::info!(target: &target, "Ready. Write an order into `order`, e.g. 'red:6 green:5 blue:4'.");
 
     // A demo can start itself: INITIAL_ORDER is written into `order` as if an
-    // operator had typed it - but only once the cell is up and the camera has
-    // seen the dice (a face of 0 means "never read"). Planned any earlier, the
-    // first transfer would go looking for a die frame that does not exist yet.
+    // operator had typed it - but only once the cell is up and has published
+    // the dice. Planned any earlier, the first transfer would go looking for a
+    // frame that does not exist yet.
     if let Ok(order) = std::env::var("INITIAL_ORDER") {
         let order = order.trim().to_string();
         if !order.is_empty() {
-            let probe = format!("{}_face_measured", config.dice[0]);
             log::info!(target: &target, "Holding the initial order '{order}' until the cell is up.");
             loop {
-                if let Some(SPValue::Int64(IntOrUnknown::Int64(face))) = StateManager::get_sp_value(&mut con, &probe).await {
-                    if face != 0 {
-                        break;
-                    }
+                if let Some(SPValue::Bool(BoolOrUnknown::Bool(true))) = StateManager::get_sp_value(&mut con, "cell_online").await {
+                    break;
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }

@@ -45,6 +45,10 @@ pub const DIE_COLOURS: [DieColour; MAX_DICE] = [
     DieColour { name: "orange", rgb: [1.00, 0.48, 0.05], pips: WHITE },
 ];
 
+/// How a die the camera has not seen yet is drawn: plain grey, no pips. It is
+/// what the control system knows about it - that there is a die, not which.
+pub const UNSEEN_GREY: [f64; 3] = [0.55, 0.55, 0.57];
+
 pub fn die_colour(name: &str) -> Option<&'static DieColour> {
     DIE_COLOURS.iter().find(|c| c.name == name)
 }
@@ -82,9 +86,15 @@ pub const FLIP_STATION_TILT_ABOVE_FRAME: &str = "flip_station_tilt_above";
 /// Published by the cell when a flip is planned: where to grip the die so that
 /// the face that should come up faces the right way in the gripper.
 pub const FLIP_GRIP_FRAME: &str = "flip_grip";
-/// Published by the cell when a flip is planned: where the flipped die is put
-/// back down in the arena.
-pub const FLIP_RETURN_FRAME: &str = "flip_return";
+/// Published by the cell when the build SOP looks at its die, and again after
+/// every flip: where the die lies now, to be picked up for the tower from.
+pub const BUILD_PICK_FRAME: &str = "build_pick";
+/// Published by the cell: the next die in the feeder, whichever it is. The feeder
+/// has no camera, so this is a place to pick from, not a die.
+pub const FEEDER_NEXT_FRAME: &str = "feeder_next";
+/// What `transfer_die` says when the robot picks from the feeder: some die, the
+/// camera will say which once it lands in the arena.
+pub const UNKNOWN_DIE: &str = "unseen";
 pub const TCP_FRAME: &str = "gripper_tcp";
 pub const TCP_ABOVE_FRAME: &str = "gripper_tcp_above";
 pub const WORLD_FRAME: &str = "world";

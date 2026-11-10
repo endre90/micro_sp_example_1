@@ -1,15 +1,19 @@
 # micro_sp example 1: the dice cell
 
 A UR5 builds a tower of coloured dice to order. Every die has to show a given
-face. A die arrives in the feeder showing whatever it shows; if that is wrong,
-it is thrown into the arena once, and from then on its face is changed by
-flipping it onto its side at the flip station - a quarter turn per flip, two
-for the face that ended up underneath. The order can change while the tower is
-being built, and an operator can knock the tower over, take a die away or throw
-one at any moment.
+face. The dice wait in a feeder, and the feeder is blind: from above they all
+look the same, and the only camera looks at the arena (the tray). So the robot
+takes the next die out of the feeder without knowing which one it is, throws it
+into the arena, and the camera reads its colour and face. A die the tower needs
+now is turned at the flip station - onto its side, a quarter turn per flip, two
+for the face that is underneath - and goes from there straight onto the tower.
+A die the tower needs later waits on a buffer pad. A die the order does not
+want stays in the arena. The order can change while the tower is being built,
+and an operator can knock the tower over, take a die away or throw one at any
+moment.
 
 The point is the control logic. Nobody wrote down a sequence for any of this.
-The model is **six operation templates, two SOPs and five automatic
+The model is **seven operation templates, two SOPs and five automatic
 transitions**, written in [`micro_sp`](https://github.com/endre90/micro_sp).
 The planner works out what to do from whatever the cell looks like at that
 moment. The same model handles every situation below without a single extra
@@ -19,36 +23,46 @@ branch.
 
 Write it as an SFC or SOP and the branches multiply:
 
-* which dice are in the feeder, in what order, and which of them already show
-  the right face (and can skip the throw);
-* every throw is a fork: right face, carry on; a face on a side, one flip;
-  the face underneath, two flips;
+* the feeder hands out the dice in an order nobody knows: every die that comes
+  out is a fork - the one needed now, one needed later (park it - and what if
+  the pads are full?), or one the order does not want;
+* every die is a fork again on its face: right already, one flip, two flips;
 * a tower that is already standing and is right up to some level, but wrong
-  above it (what comes off, what can be parked on a pad with its face kept,
-  what has to be thrown off and flipped);
+  above it (what comes off, what can be parked on a pad, what goes where);
 * an order that changes halfway through, at any step;
 * a disturbance at any step: the tower knocked over, a die taken off, a die
   thrown into the arena. Each of those leaves the cell in a different state,
   and every one of those states needs its own recovery branch.
 
-Six dice, six faces, three pads and a tower of up to six levels give tens of
-thousands of reachable situations. Here they all go through the same few
-lines:
+Here they all go through the same few lines:
 
-| Template | Moves a die from | to | The planner assumes |
+| Template | Moves a die from | to | SOP |
 |---|---|---|---|
-| `get_face_{die}` | feeder / arena | arena | it ends up showing the face the order wants (thrown once if it is in the feeder, then flipped until it does) |
-| `stack_{die}_on_level_{k}` | feeder / arena | tower level *k* | - |
-| `throw_{die}_from_level_{k}` | top of the tower | arena | nothing about the face |
-| `throw_{die}_from_pad_{j}` | pad *j* | arena | nothing about the face |
-| `unstack_level_{k}_to_pad_{j}` | top of the tower | pad *j* | the face is kept |
-| `stack_pad_{j}_on_level_{k}` | pad *j* | tower level *k* | the face is kept |
+| `fetch_{die}` | feeder | arena | transfer (throw) |
+| `stack_{die}_on_level_{k}` | arena | tower level *k*, turned on the way | build |
+| `park_{die}_on_pad_{j}` | arena | pad *j* | transfer |
+| `stack_pad_{j}_on_level_{k}` | pad *j* | tower level *k*, turned on the way | build |
+| `unstack_level_{k}_to_pad_{j}` | top of the tower | pad *j* | transfer |
+| `throw_{die}_from_level_{k}` | top of the tower | arena | transfer (throw) |
+| `throw_{die}_from_pad_{j}` | pad *j* (a die no longer wanted) | arena | transfer (throw) |
 
-With six dice and three pads these expand to 132 planned operations. The
-planner (micro_sp's breadth-first search) picks the shortest sequence. On this
-machine that takes 10-400 ms for an ordinary order, and 3.4 s for the worst
-case tested: reversing a full six-dice tower takes 15 steps, keeps three dice
-on the pads with their faces and throws off and re-faces the other three.
+**Planning with a blind feeder.** The model knows which dice it has *not seen*
+yet - those are in the feeder - but not which slot holds which. `fetch_{die}`
+assumes the next die out is `{die}`: the plan is a hopeful one. When the camera
+says otherwise, the step fails, the model takes in what the camera saw, and the
+goal is replanned with one more die known. The rule that brings in the pads: the
+feeder is only used while no die the order wants is lying in the arena (unless
+every pad is taken), so a die that came out before its turn is parked first.
+
+**Faces are the build SOP's business.** It looks at the die, and turns it at the
+flip station none, one or two times as it lies, then picks it up from the
+station and stacks it. So the planner never reasons about the faces of loose
+dice - only that a stacked die shows what the order wants.
+
+With six dice and three pads the templates expand to 150 planned operations.
+The planner (micro_sp's breadth-first search) picks the shortest sequence. On
+this machine that takes a few milliseconds to 1.4 s (six unseen dice, a
+twelve-step plan); reversing a full six-dice tower takes 12 steps and 0.6 s.
 `dice_cell/tests/planning.rs` holds these cases as tests.
 
 How the work is split:
@@ -57,18 +71,20 @@ How the work is split:
   `dice_cell/src/model/tasks.rs`.
 * **SOPs** (skill level): the fixed motions, one SOP per way of handling a
   die. *Transfer* moves one die: travel, descend, grip, lift, travel, descend,
-  release (place or throw), retract. *Flip* turns one die a quarter: grip it
-  turned so the right face is on the right side, carry it to the flip
-  station, tip the tool over in the air, set the die down on its side, take it
-  again from above and put it back in the arena. Both keep to the same two
-  rules, which are what keep the arm clear of the table, the tower and the
-  dice: travel only at a fixed safe height (the TCP at 0.34 m, through a
-  `*_transit` frame above each place) with joint moves, and go down to and up
-  from a place only in a straight vertical line (`move_l`), the last 10 cm
-  slowly. This is `dice_cell/src/model/skills.rs`. The planned operations hand
-  them parameters; they never see the motions.
-* **Automatic transitions**: when the camera reports a change the model did not
-  make, they copy the camera's picture into the model's belief and stop the
+  release (place or throw), retract. *Build* takes one die to the tower: the
+  cell looks at it, then up to two flips - grip it turned so the right face is
+  on the right side, carry it to the flip station, tip the tool over in the
+  air, set the die down on its side - each one only if it is still needed
+  (micro_sp `Alternative` branches), then pick it up from wherever it now lies
+  and stack it. Both keep to the same two rules, which are what keep the arm
+  clear of the table, the tower and the dice: travel only at a fixed safe
+  height (the TCP at 0.34 m, through a `*_transit` frame above each place) with
+  joint moves, and go down to and up from a place only in a straight vertical
+  line (`move_l`), the last 10 cm slowly. This is
+  `dice_cell/src/model/skills.rs`. The planned operations hand them
+  parameters; they never see the motions.
+* **Automatic transitions**: when the cell reports a change the model did not
+  make, they copy the cell's picture into the model's belief and stop the
   running plan at its next step. This is `dice_cell/src/model/reactions.rs`.
 * **Goal**: "the tower is the order". It is written against the order
   variables, so it never changes. A new order changes what the goal means, and
@@ -142,7 +158,7 @@ running plan is stopped at its next step and replanned instead.
 | Value | What happens |
 |---|---|
 | `knock_tower` | The whole tower tumbles into the arena, every die showing a new face |
-| `steal_top` | The top die is taken off and put back in the feeder, face unchanged |
+| `steal_top` | The top die is taken off and put back in the feeder - out of sight, so unseen (grey) again |
 | `steal <colour>` | That die goes back to the feeder; anything above it falls into the arena |
 | `bump <colour>` | That die is thrown into the arena; anything above it falls too |
 | `reset` | Every die back in the feeder, in a new order, showing new faces |
@@ -153,19 +169,22 @@ from where the dice landed.
 
 ### A script for a demo
 
-1. `order` = `red:6 green:5 blue:4 yellow:3`. Watch the plan (Goals tab): a die
-   that already happens to show its face is not thrown. One that comes up
-   wrong is flipped at the station - once, or twice if its face ended up
-   underneath.
+1. `order` = `red:6 green:5 blue:4 yellow:3`. Watch the plan (Goals tab): it
+   hopes the feeder gives red first. The dice in the feeder are grey and
+   blank in RViz - nobody knows which is which until one lands in the arena.
+   When it is the wrong colour, the plan changes: a die the tower needs later
+   goes to a pad, one it does not need stays in the arena. A die that already
+   shows its face goes straight to the tower; the others are flipped at the
+   station - once, or twice if the face is underneath - and go from there.
 2. Halfway up, `order` = `red:6 yellow:3 blue:2`. The plan stops at the next
    step and a new one takes off what is wrong and reuses what is right.
-3. Once it is done, `disturbance` = `knock_tower`. The cell rebuilds it with
-   flips only - the dice are in the arena already - skipping any die that
-   landed on the right face.
+3. Once it is done, `disturbance` = `knock_tower`. The cell rebuilds it
+   straight from the arena, flipping only the dice that need it.
 4. During a build, `disturbance` = `steal_top`, then `bump blue`.
 5. `order` = `clear`.
 
-The **Production** tab counts throws, wrong faces, flips, transfers, replans,
+The **Production** tab counts throws, dice that came out of the feeder as
+another colour than hoped (`kpi_run_other_colour`), flips, transfers, replans,
 disturbances and orders, and shows the operation count against the number of
 templates (`kpi_model_*`).
 
@@ -175,11 +194,11 @@ templates (`kpi_model_*`).
 |---|---|
 | `order`, `order_status` | The order, and whether it was taken |
 | `order_k`, `order_k_face` | The order per level, as the model uses it |
-| `level_k`, `level_k_face`, `pad_j`, `pad_j_face` | What the model believes stands where |
-| `{colour}_loose`, `{colour}_face` | What it believes about a loose die (in the feeder or the arena) |
-| `{colour}_in_arena` | The die has had its one throw: its face is changed by flipping from now on |
-| `*_measured` | What the camera sees (written only by `cell`) |
-| `transfer_task` | What the robot is doing right now (a transfer, or `flip <colour>`) |
+| `level_k`, `level_k_face`, `pad_j` | What the model believes stands where |
+| `{colour}_seen` | The camera has read this die; false means it is somewhere in the feeder |
+| `{colour}_in_arena` | The die is lying in the arena |
+| `*_measured` | What the cell reports (written only by `cell`): the camera for the arena, tracking for the tower and pads, a count for the feeder |
+| `transfer_task` | What the robot is doing right now (`fetch red?` is a hope, not a fact) |
 | `world_changed`, `replan_pending` | A disturbance was seen; the running plan is being stopped |
 | `tower_goal` | The goal predicate, for posting by hand from the Goals tab |
 
@@ -189,11 +208,10 @@ micro_sp's goal runner replans "the same goal" when `{sp}_replan_for_same_goal`
 is set, but only once the current plan has ended. The cell gets there in two
 ways:
 
-* **A throw or a flip comes up wrong.** `get_face_{die}` *fails*, and its
-  failure retry starts it again - which, with the die now in the arena, is a
-  flip. The cell picks the flip: the wanted face if it is on a side, otherwise
-  any side face, and the retry after that brings up the wanted one. No replan
-  is needed, because there is nothing to decide.
+* **The feeder gave another colour.** `fetch_{die}` *fails*: it raises
+  `world_changed` and `replan_pending` itself, and the goal is replanned with
+  the die the camera saw. A wrong face needs no replan at all - the build SOP
+  flips until it is right.
 * **The world changed.** The cell raises `world_changed`, and an automatic
   transition copies the camera's reading into the belief and sets
   `replan_pending`. That holds back the next planned step. After
@@ -228,7 +246,7 @@ step, or the end of the plan, ask for the replan.
 
 * **The planner's depth limit is 20 steps** (and it has a 5 s budget); both are
   hard-coded in micro_sp's `planner_ticker`. Six dice fit, including the worst
-  case above (15 steps). Larger cells would need a heuristic search, which this
+  case above (12 steps). Larger cells would need a heuristic search, which this
   example makes a good case for.
 * The robot is kinematic only: there is no collision checking at run time.
   The arm stays clear because of the route the SOPs take (safe height, vertical
@@ -245,7 +263,14 @@ step, or the end of the plan, ask for the replan.
 * The dice are not physically simulated. A throw picks a free spot in the arena,
   a random yaw and a random orientation, and animates the fall. A flip is
   exact: the die lands on its side the way the gripper held it.
-* The camera is perfect: `*_measured` is the truth.
+* The camera is perfect for what it sees - the arena. A die it has seen is
+  tracked from then on (the robot put it where it is), and the tower and pads
+  report their occupants to the model when an operator disturbs them, which a
+  real cell would need a sensor or an operator's word for.
+* A die that came out of the feeder before its turn waits on a pad - so does a
+  wanted die knocked into the arena, if the feeder still has to be used: the
+  rule is "no wanted die lying in the arena when the feeder is used". With all
+  pads taken, the feeder is used anyway and the die stays in the arena.
 
 ## Tests
 

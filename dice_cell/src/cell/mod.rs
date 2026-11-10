@@ -3,17 +3,23 @@
 //! One loop, so a gripper command and a disturbance can never interleave:
 //!
 //! * **Gripper** - serves the `gripper_request_*` channel. `grip` closes on a
-//!   die only if that die is really between the fingers; `place` sets it down
-//!   on whatever is below (and if that is not where it was meant to go - the
-//!   tower was knocked over in the meantime - it says so); `throw` lets it
-//!   tumble into the arena and land wherever, showing whatever. `plan_flip`
-//!   works out how to grip a die so that tipping it onto the flip station
-//!   brings the wanted face up (or one step closer to it), and publishes where.
+//!   die only if that die is really between the fingers (for the die `unseen`,
+//!   on whichever die is); `place` sets it down on whatever is below (and if
+//!   that is not where it was meant to go - the tower was knocked over in the
+//!   meantime - it says so); `throw` lets it tumble into the arena and land
+//!   wherever, showing whatever. `look` finds a die for the build SOP and says
+//!   whether it still has to be turned; `plan_flip` works out how to grip it so
+//!   that tipping it onto the flip station brings the wanted face up (or one
+//!   step closer to it), and publishes where.
 //!
 //! A die keeps its whole orientation, not just its top face: it is gripped as it
 //! lies, turns with the gripper, and lands however the gripper was turned when it
 //! let go. That is what makes a flip come out right.
-//! * **Camera** - after every change, the `*_measured` variables.
+//! * **Camera** - after every change, the `*_measured` variables. It looks at
+//!   the arena only: a die from the feeder gets its colour (in RViz too) when
+//!   it lands there.
+//! * **Feeder** - publishes `feeder_next`, where the next die in it is. Which
+//!   die that is, nobody knows.
 //! * **Operator** - the `disturbance` variable: knock the tower over, take a
 //!   die away, throw one, reset the cell.
 //!
@@ -43,8 +49,6 @@ const ANIMATION_STEP_MS: u64 = 25;
 pub struct Cell {
     pub world: World,
     pub con: SPConnection,
-    /// Where the die being flipped goes back down in the arena, once it is flipped.
-    flip_return: Option<(f64, f64)>,
 }
 
 enum Outcome {
@@ -55,7 +59,7 @@ enum Outcome {
 impl Cell {
     pub async fn new(world: World, connection_manager: &Arc<ConnectionManager>) -> Cell {
         let con = connection_manager.get_connection().await;
-        Cell { world, con, flip_return: None }
+        Cell { world, con }
     }
 
     /// Puts every die where the world says it is and tells the model to look.
@@ -69,11 +73,12 @@ impl Cell {
             self.publish_transit_of(&name).await;
         }
         self.publish_measured(true).await;
+        StateManager::set_sp_value(&mut self.con, "cell_online", &true.to_spvalue()).await;
     }
 
     async fn publish_frames_of(&mut self, name: &str) {
         let Some(die) = self.world.die(name).cloned() else { return };
-        let frames = vec![self.world.pose_frame(&die), self.world.resting_body_frame(&die)];
+        let frames = vec![self.world.pose_frame(&die), self.world.resting_body_frame(&die), self.world.pips_frame(&die)];
         if let Err(e) = TransformsManager::insert_transforms(&mut self.con, &frames).await {
             log::error!(target: T, "Could not move {name}: {e}");
         }
@@ -120,6 +125,47 @@ impl Cell {
             state.add_mut(SPAssignment::new(SPVariable::new("world_changed", SPValueType::Bool), true.to_spvalue()), T);
         }
         StateManager::set_state(&mut self.con, &state).await;
+        self.publish_feeder_next().await;
+    }
+
+    /// `feeder_next` and its transit: where the robot picks the next die from the
+    /// feeder. Left alone while the gripper holds a die, so the lift after a grip
+    /// in the feeder goes back up from the slot it was in.
+    async fn publish_feeder_next(&mut self) {
+        if self.world.holding().is_some() {
+            return;
+        }
+        let Some(next) = self.world.next_in_feeder().map(|d| d.name.clone()) else { return };
+        let Some(pose) = self.world_pose(&die_frame(&next)).await else { return };
+        let frame = stamped(FEEDER_NEXT_FRAME, WORLD_FRAME, pose, MapOrUnknown::UNKNOWN, false);
+        if let Err(e) = TransformsManager::insert_transform(&mut self.con, &frame).await {
+            log::error!(target: T, "Could not write {FEEDER_NEXT_FRAME}: {e}");
+        }
+        self.publish_transit(FEEDER_NEXT_FRAME, &pose).await;
+    }
+
+    async fn wanted_face(&mut self, name: &str) -> Option<i64> {
+        match StateManager::get_sp_value(&mut self.con, &format!("{name}_wanted_face")).await {
+            Some(SPValue::Int64(IntOrUnknown::Int64(face))) if (1..=6).contains(&face) => Some(face),
+            _ => None,
+        }
+    }
+
+    /// Tells the build SOP whether `name` still has to be turned, and where to
+    /// pick it up for the tower: `build_pick`, where it lies now.
+    async fn publish_build_pick(&mut self, name: &str) -> Result<bool, String> {
+        let die = self.world.die(name).cloned().ok_or(format!("there is no {name} die"))?;
+        if die.loc == Loc::Gripper {
+            return Err(format!("{name} is in the gripper"));
+        }
+        let wanted = self.wanted_face(name).await.ok_or(format!("{name} is not in the order"))?;
+        let pose = self.world_pose(&die_frame(name)).await.ok_or(format!("cannot see {name}"))?;
+        let frame = stamped(BUILD_PICK_FRAME, WORLD_FRAME, pose, MapOrUnknown::UNKNOWN, false);
+        let _ = TransformsManager::insert_transform(&mut self.con, &frame).await;
+        self.publish_transit(BUILD_PICK_FRAME, &pose).await;
+        let flip_needed = die.face() != wanted;
+        StateManager::set_sp_value(&mut self.con, "gripper_flip_needed", &flip_needed.to_spvalue()).await;
+        Ok(flip_needed)
     }
 
     async fn world_position(&mut self, frame: &str) -> Option<Vector3<f64>> {
@@ -137,10 +183,35 @@ impl Cell {
 
     // --- Gripper ----------------------------------------------------------------
 
+    /// The die nearest the TCP, for a grip on "whichever die is there".
+    async fn die_at_fingers(&mut self) -> Option<String> {
+        let tcp = self.world_position(TCP_FRAME).await?;
+        let mut best: Option<(String, f64)> = None;
+        let names: Vec<String> = self.world.dice.iter().map(|d| d.name.clone()).collect();
+        for name in names {
+            if let Some(at) = self.world_position(&die_frame(&name)).await {
+                let distance = (tcp - at).norm();
+                if best.as_ref().is_none_or(|(_, d)| distance < *d) {
+                    best = Some((name, distance));
+                }
+            }
+        }
+        best.map(|(name, _)| name)
+    }
+
     async fn grip(&mut self, name: &str) -> Outcome {
         if let Some(held) = self.world.holding() {
             return Outcome::Failed(format!("already holding {}", held.name));
         }
+        let name = if name == UNKNOWN_DIE {
+            match self.die_at_fingers().await {
+                Some(name) => name,
+                None => return Outcome::Failed("closed on nothing".to_string()),
+            }
+        } else {
+            name.to_string()
+        };
+        let name = name.as_str();
         let Some(die) = self.world.die(name).cloned() else {
             return Outcome::Failed(format!("there is no {name} die"));
         };
@@ -160,19 +231,30 @@ impl Cell {
         };
         let held = snap_to_aligned(&(tcp_pose.rotation.inverse() * body_pose.rotation));
         let was = die.loc.clone();
+        let what = if die.seen { name.to_string() } else { "a die".to_string() };
         let die = self.world.die_mut(name).unwrap();
         die.loc = Loc::Gripper;
         die.yaw = 0.0;
         die.body = held;
         self.publish_frames_of(name).await;
         self.publish_measured(false).await;
-        Outcome::Succeeded(format!("gripped {name} ({})", describe_loc(&was)))
+        Outcome::Succeeded(format!("gripped {what} ({})", describe_loc(&was)))
+    }
+
+    /// The held die, checked against what the request names.
+    fn held_as(&self, name: &str) -> Result<String, String> {
+        match self.world.holding() {
+            Some(d) if name == UNKNOWN_DIE || d.name == name => Ok(d.name.clone()),
+            _ => Err(format!("not holding {name}")),
+        }
     }
 
     async fn place(&mut self, name: &str, target: &str) -> Outcome {
-        if self.world.holding().map(|d| d.name.as_str()) != Some(name) {
-            return Outcome::Failed(format!("not holding {name}"));
-        }
+        let name = match self.held_as(name) {
+            Ok(n) => n,
+            Err(e) => return Outcome::Failed(e),
+        };
+        let name = name.as_str();
         let Some(tcp_pose) = self.world_pose(TCP_FRAME).await else {
             return Outcome::Failed("cannot see the gripper".to_string());
         };
@@ -183,9 +265,6 @@ impl Cell {
             } else {
                 (Loc::Station, false)
             }
-        } else if target == FLIP_RETURN_FRAME {
-            let (x, y) = self.flip_return.take().unwrap_or_else(|| self.world.free_arena_spot());
-            (Loc::Arena(x, y), false)
         } else if let Some(k) = target.strip_prefix("level_").and_then(|k| k.parse::<usize>().ok()) {
             // Whatever is below it decides where a die ends up. If the tower
             // shrank while the robot was on its way, the die drops onto what is left.
@@ -216,17 +295,41 @@ impl Cell {
         if surprise {
             log::warn!(target: T, "{name} was put on {target} but ended up {}.", describe_loc(&landed));
         }
+        if landed == Loc::Station {
+            // A flip: say whether it was enough, and where to pick the die up.
+            let flips = match StateManager::get_sp_value(&mut self.con, "kpi_run_flips").await {
+                Some(SPValue::Int64(IntOrUnknown::Int64(n))) => n,
+                _ => 0,
+            };
+            StateManager::set_sp_value(&mut self.con, "kpi_run_flips", &(flips + 1).to_spvalue()).await;
+            let face = self.world.die(name).unwrap().face();
+            return match self.publish_build_pick(name).await {
+                Ok(true) => Outcome::Succeeded(format!("flipped {name} to {face}, one more to go")),
+                Ok(false) => Outcome::Succeeded(format!("flipped {name} to {face}")),
+                Err(e) => Outcome::Failed(e),
+            };
+        }
         Outcome::Succeeded(format!("placed {name} {}", describe_loc(&landed)))
     }
 
-    async fn throw(&mut self, name: &str) -> Outcome {
-        if self.world.holding().map(|d| d.name.as_str()) != Some(name) {
-            return Outcome::Failed(format!("not holding {name}"));
-        }
-        self.tumble_into_arena(&[name.to_string()]).await;
+    async fn look(&mut self, name: &str) -> Outcome {
         let face = self.world.die(name).map(|d| d.face()).unwrap_or(0);
+        match self.publish_build_pick(name).await {
+            Ok(true) => Outcome::Succeeded(format!("{name} shows {face}: to be turned")),
+            Ok(false) => Outcome::Succeeded(format!("{name} shows {face}: as wanted")),
+            Err(e) => Outcome::Failed(e),
+        }
+    }
+
+    async fn throw(&mut self, name: &str) -> Outcome {
+        let name = match self.held_as(name) {
+            Ok(n) => n,
+            Err(e) => return Outcome::Failed(e),
+        };
+        self.tumble_into_arena(std::slice::from_ref(&name)).await;
+        let face = self.world.die(&name).map(|d| d.face()).unwrap_or(0);
         self.publish_measured(false).await;
-        Outcome::Succeeded(format!("threw {name}: {face}"))
+        Outcome::Succeeded(format!("threw a die: the camera sees {name}, showing {face}"))
     }
 
     /// Plans one flip of `name` towards `wanted`: which face to bring up next,
@@ -278,27 +381,14 @@ impl Cell {
         let _ = TransformsManager::insert_transform(&mut self.con, &grip_frame).await;
         self.publish_transit(FLIP_GRIP_FRAME, &grip).await;
 
-        // Back down in the arena afterwards, as near the station as there is room.
-        let Some(arena) = self.world_pose(ARENA_FRAME).await else {
-            return Outcome::Failed("cannot see the arena".to_string());
-        };
-        let Some(station) = self.world_pose(FLIP_STATION_FRAME).await else {
-            return Outcome::Failed("cannot see the flip station".to_string());
-        };
-        let station_in_arena = arena.inverse() * station;
-        let (x, y) = self.world.free_arena_spot_near((station_in_arena.translation.x, station_in_arena.translation.y));
-        self.flip_return = Some((x, y));
-        let back = iso(Vector3::new(x, y, ARENA_DIE_Z), UnitQuaternion::identity());
-        let return_frame = stamped(FLIP_RETURN_FRAME, ARENA_FRAME, back, MapOrUnknown::UNKNOWN, false);
-        let _ = TransformsManager::insert_transform(&mut self.con, &return_frame).await;
-        self.publish_transit(FLIP_RETURN_FRAME, &(arena * back)).await;
-
         let steps = if wanted == 7 - top { "two flips" } else { "one flip" };
         Outcome::Succeeded(format!("{name} shows {top}; bringing {next} up ({steps} to {wanted})"))
     }
 
     /// Dice falling into the arena: each lands on a free spot, yawed and showing
-    /// a face at random, and gets there with a bit of a tumble on the way.
+    /// a face at random, and gets there with a bit of a tumble on the way. The
+    /// camera reads each one as it lands - which is when a die from the feeder
+    /// gets its colour.
     async fn tumble_into_arena(&mut self, names: &[String]) {
         struct Flight {
             name: String,
@@ -357,6 +447,9 @@ impl Cell {
             tokio::time::sleep(Duration::from_millis(ANIMATION_STEP_MS)).await;
         }
         for f in &flights {
+            if let Some(die) = self.world.die_mut(&f.name) {
+                die.seen = true;
+            }
             self.publish_frames_of(&f.name).await;
         }
     }
@@ -373,6 +466,8 @@ impl Cell {
         let die = self.world.die_mut(name).unwrap();
         die.loc = Loc::Feeder(slot);
         die.yaw = 0.0;
+        // Out of sight: from now on it is just a die in the feeder.
+        die.seen = false;
         self.publish_frames_of(name).await;
         Ok(format!("{name} put back in feeder slot {slot}, still showing {}", self.world.die(name).unwrap().face()))
     }
@@ -496,12 +591,12 @@ pub async fn run_cell(mut cell: Cell) {
                 "grip" => cell.grip(&die).await,
                 "place" => cell.place(&die, &target).await,
                 "throw" => cell.throw(&die).await,
+                "look" => cell.look(&die).await,
                 "plan_flip" => {
                     // The face to flip towards is the order's, for this die.
-                    let wanted = StateManager::get_sp_value(&mut cell.con, &format!("{die}_wanted_face")).await;
-                    match wanted {
-                        Some(SPValue::Int64(IntOrUnknown::Int64(face))) => cell.plan_flip(&die, face).await,
-                        _ => Outcome::Failed(format!("cannot read {die}_wanted_face")),
+                    match cell.wanted_face(&die).await {
+                        Some(face) => cell.plan_flip(&die, face).await,
+                        None => Outcome::Failed(format!("{die} is not in the order")),
                     }
                 }
                 other => Outcome::Failed(format!("unknown gripper command '{other}'")),
@@ -526,6 +621,7 @@ pub async fn run_cell(mut cell: Cell) {
         let disturbance = state.get_string_or_value("disturbance", String::new(), T);
         if !disturbance.trim().is_empty() && request_state != "executing" {
             let result = cell.disturb(disturbance.trim()).await;
+            cell.publish_feeder_next().await;
             let mut reply = cell.world.measured_state();
             put(&mut reply, "disturbance", "".to_spvalue());
             match result {

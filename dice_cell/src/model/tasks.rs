@@ -1,54 +1,52 @@
 //! The planned operations: what the cell *can* do, as the planner sees it.
 //!
-//! Six templates, instantiated per die, level and pad:
+//! Seven templates, instantiated per die, level and pad:
 //!
-//! | Template | From | To | What the planner assumes |
+//! | Template | From | To | SOP |
 //! |---|---|---|---|
-//! | `get_face_{die}` | feeder / arena | arena | it ends up showing the face the order wants |
-//! | `stack_{die}_on_level_{k}` | feeder / arena | tower level k | - |
-//! | `throw_{die}_from_level_{k}` | top of the tower | arena | nothing about the face |
-//! | `throw_{die}_from_pad_{j}` | pad j | arena | nothing about the face |
-//! | `unstack_level_{k}_to_pad_{j}` | top of the tower | pad j | the face is kept |
-//! | `stack_pad_{j}_on_level_{k}` | pad j | tower level k | the face is kept |
+//! | `fetch_{die}` | feeder | arena | transfer (throw) |
+//! | `stack_{die}_on_level_{k}` | arena | tower level k | build |
+//! | `park_{die}_on_pad_{j}` | arena | pad j | transfer |
+//! | `stack_pad_{j}_on_level_{k}` | pad j | tower level k | build |
+//! | `unstack_level_{k}_to_pad_{j}` | top of the tower | pad j | transfer |
+//! | `throw_{die}_from_level_{k}` | top of the tower | arena | transfer (throw) |
+//! | `throw_{die}_from_pad_{j}` | pad j | arena | transfer (throw) |
 //!
-//! None of them names a sequence. Which dice need a new face, in what order,
-//! whether a die that happens to show the right face can skip it, what to take
-//! off a wrong tower and where to park it - all of that is the planner's.
+//! None of them names a sequence. Which die to go for next, what to take off a
+//! wrong tower and where to park it, what to do with a die that came out of the
+//! feeder before its turn - all of that is the planner's.
 //!
-//! `get_face_{die}` is "throw it once, then flip it until it shows the wanted
-//! face". A die still in the feeder is thrown into the arena (the transfer SOP);
-//! a die already in the arena is flipped a quarter at the flip station (the flip
-//! SOP). Whichever it was, an attempt that leaves the wrong face up *fails*, and
-//! the failure's retry starts the operation over - by then the die is in the
-//! arena, so the retry flips it. A face on a side is one flip away, the one
-//! underneath two, so after the throw it takes at most two more attempts, and
-//! the planner may count on the outcome. The two ways of starting are two
-//! preconditions of the one operation, so to the planner it is one step, as a
-//! throw used to be.
+//! **The feeder is blind.** Its dice all look the same from above, and the only
+//! camera looks at the arena. So the model does not know which die is in which
+//! slot - only which dice it has not seen yet. `fetch_{die}` takes the next die
+//! out of the feeder and throws it into the arena, and the planner assumes it is
+//! `{die}`: the plan is a hopeful one. When the camera says it is another colour,
+//! the operation fails, the model takes in what the camera saw, and the goal is
+//! replanned with one more die known - typically "park it on a pad and fetch
+//! again". So a fetch is only allowed while no die the order wants is lying in
+//! the arena (unless every pad is taken): the pads are where the dice that came
+//! out too early wait for their turn. A die the order does not want at all is
+//! left in the arena.
 //!
-//! The throws that clear a die off the tower or a pad are single throws, and the
-//! planner is told the face is unknown afterwards - which is what makes it
-//! prefer parking a die that already shows the right face over throwing it.
-//! If such a throw happens to land on the wanted face anyway, the plan's next
-//! `get_face_{die}` no longer applies, goes stale, and the goal is replanned
-//! without it (see [`stale_plan_transitions`]).
+//! **Faces are the build SOP's business.** A die going onto the tower is turned
+//! at the flip station on the way until it shows the face the order wants - none,
+//! one or two quarter turns, as the die lies - and goes from the station straight
+//! onto the tower. So the planner never reasons about faces of loose dice at
+//! all: it only knows that a die stacked on level k shows `order_k_face`.
 
 use micro_sp::*;
 
-use super::skills::{FLIP_SOP, TRANSFER_SOP};
-use crate::{ARENA_DROP_FRAME, Config, die_frame, level_frame, pad_frame, transit_frame};
+use super::skills::{BUILD_SOP, TRANSFER_SOP};
+use crate::{ARENA_DROP_FRAME, Config, FEEDER_NEXT_FRAME, UNKNOWN_DIE, die_frame, level_frame, pad_frame, transit_frame};
 
-/// The throw, then at most two flips - and one to spare.
-const GET_FACE_RETRIES: i64 = 3;
-
-/// A planned step never times out while its transfer is running: every step
-/// of the SOP has its own, shorter timeout, so the SOP always ends - and only
-/// then may the step end. A step that gave up first would leave the SOP
-/// running with nobody to collect it, and the transfer skill locked.
+/// A planned step never times out while its SOP is running: every step of the
+/// SOP has its own, shorter timeout, so the SOP always ends - and only then may
+/// the step end. A step that gave up first would leave the SOP running with
+/// nobody to collect it, and the skills locked.
 const PLANNED_STEP_TIMEOUT_MS: i64 = 24 * 3_600_000;
 
-/// The six templates, for the GUI's Production tab.
-pub const TEMPLATE_COUNT: i64 = 6;
+/// The seven templates, for the GUI's Production tab.
+pub const TEMPLATE_COUNT: i64 = 7;
 
 fn parse(name: &str, guard: &str, runner_guard: &str, actions: &[String], runner_actions: &[String], state: &State) -> Transition {
     Transition::parse(
@@ -61,90 +59,93 @@ fn parse(name: &str, guard: &str, runner_guard: &str, actions: &[String], runner
     )
 }
 
-/// What a planned operation hands the transfer SOP.
-struct Transfer {
-    /// The die's id, or `var:...` naming the location variable that holds it.
-    die: String,
-    pick: String,
-    pick_transit: String,
-    place: String,
-    place_transit: String,
-    release: &'static str,
-    label: String,
+/// What a planned operation hands an SOP.
+enum Move {
+    /// The transfer SOP: pick at `pick`, take it to `place`, let go with `release`.
+    Transfer { die: String, pick: String, place: String, release: &'static str, label: String },
+    /// The build SOP: find the die, turn it as needed, set it down at `place`.
+    Build { die: String, place: String, label: String },
 }
 
-/// The runner guard every planned operation starts on: the transfer skill is
-/// free, and nothing has told us the plan is stale.
-const READY: &str = "var:transfer_busy == false && var:replan_pending == false && var:sop_transfer_sop_state == initial && var:sop_flip_sop_state == initial";
-const SOP_DONE: &str = "var:sop_transfer_sop_state == completed";
-const FLIP_DONE: &str = "var:sop_flip_sop_state == completed";
+/// The runner guard every planned operation starts on: the skills are free, and
+/// nothing has told us the plan is stale.
+const READY: &str = "var:transfer_busy == false && var:replan_pending == false && var:sop_transfer_sop_state == initial && var:sop_build_sop_state == initial";
 
-fn start_runner_actions(t: &Transfer) -> Vec<String> {
-    vec![
-        format!("var:transfer_die <- {}", t.die),
-        format!("var:transfer_pick <- {}", t.pick),
-        format!("var:transfer_pick_transit <- {}", t.pick_transit),
-        format!("var:transfer_place <- {}", t.place),
-        format!("var:transfer_place_transit <- {}", t.place_transit),
-        format!("var:transfer_release <- {}", t.release),
-        format!("var:transfer_task <- \"{}\"", t.label),
-        format!("var:kpi_current_task <- \"{}\"", t.label),
-        "var:transfer_busy <- true".to_string(),
-        format!("var:{TRANSFER_SOP}_sop_enabled <- true"),
-    ]
+fn sop_done(sop: &str) -> String {
+    format!("var:{sop}_sop_state == completed")
 }
 
-/// What a planned operation hands the flip SOP: just the die.
-fn start_flip_runner_actions(die: &str) -> Vec<String> {
+impl Move {
+    fn sop(&self) -> &'static str {
+        match self {
+            Move::Transfer { .. } => TRANSFER_SOP,
+            Move::Build { .. } => BUILD_SOP,
+        }
+    }
+
+    fn start_runner_actions(&self) -> Vec<String> {
+        let (mut actions, label) = match self {
+            Move::Transfer { die, pick, place, release, label } => (
+                vec![
+                    format!("var:transfer_die <- {die}"),
+                    format!("var:transfer_pick <- {pick}"),
+                    format!("var:transfer_pick_transit <- {}", transit_frame(pick)),
+                    format!("var:transfer_place <- {place}"),
+                    format!("var:transfer_place_transit <- {}", transit_frame(place)),
+                    format!("var:transfer_release <- {release}"),
+                ],
+                label,
+            ),
+            Move::Build { die, place, label } => (
+                vec![
+                    format!("var:transfer_die <- {die}"),
+                    format!("var:transfer_place <- {place}"),
+                    format!("var:transfer_place_transit <- {}", transit_frame(place)),
+                ],
+                label,
+            ),
+        };
+        actions.extend([
+            format!("var:transfer_task <- \"{label}\""),
+            format!("var:kpi_current_task <- \"{label}\""),
+            "var:transfer_busy <- true".to_string(),
+            format!("var:{}_sop_enabled <- true", self.sop()),
+        ]);
+        actions
+    }
+}
+
+/// Puts the skills back to rest after an SOP ended, whichever way.
+fn release_skills() -> Vec<String> {
     vec![
-        format!("var:transfer_die <- {die}"),
-        format!("var:transfer_task <- \"flip {die}\""),
-        format!("var:kpi_current_task <- \"flip {die}\""),
-        "var:transfer_busy <- true".to_string(),
-        format!("var:{FLIP_SOP}_sop_enabled <- true"),
+        format!("var:{TRANSFER_SOP}_sop_state <- initial"),
+        format!("var:{BUILD_SOP}_sop_state <- initial"),
+        "var:transfer_busy <- false".to_string(),
+        "var:kpi_current_task <- \"-\"".to_string(),
     ]
 }
 
 fn finish_runner_actions(extra: &[String]) -> Vec<String> {
-    let mut actions = vec![
-        format!("var:{TRANSFER_SOP}_sop_state <- initial"),
-        format!("var:{FLIP_SOP}_sop_state <- initial"),
-        "var:transfer_busy <- false".to_string(),
-        "var:kpi_current_task <- \"-\"".to_string(),
-        "var:kpi_run_transfers += 1".to_string(),
-    ];
+    let mut actions = release_skills();
+    actions.push("var:kpi_run_transfers += 1".to_string());
     actions.extend(extra.iter().cloned());
     actions
 }
 
-/// After a single throw the camera says what came up. The planner was told
-/// "unknown" (face 0); at runtime the measured face replaces that.
-fn single_throw_runner_actions(die: &str) -> Vec<String> {
-    vec![
-        format!("var:{die}_face <- var:{die}_face_measured"),
-        "var:kpi_run_throws += 1".to_string(),
-    ]
+/// The model's picture of the cell is suspect: look again (world_changed) and
+/// do not start anything else from the old plan (replan_pending).
+fn look_again(extra: &[&str]) -> Vec<String> {
+    let mut actions = release_skills();
+    actions.push("var:world_changed <- true".to_string());
+    actions.push("var:replan_pending <- true".to_string());
+    actions.extend(extra.iter().map(|a| a.to_string()));
+    actions
 }
 
 /// The SOP failed - a motion the robot could not make, or a grip that closed
-/// on nothing because the die was not where the model thought. Either way the
-/// model's picture of the cell is suspect: look again (world_changed) and do
-/// not start anything else from the old plan (replan_pending).
+/// on nothing because the die was not where the model thought.
 fn sop_failed(name: &str, sop: &str, state: &State) -> Transition {
-    parse(
-        &format!("{sop}_failed_{name}"),
-        "true",
-        &format!("var:{sop}_sop_state == fatal"),
-        &[],
-        &[
-            format!("var:{sop}_sop_state <- initial"),
-            "var:transfer_busy <- false".to_string(),
-            "var:kpi_current_task <- \"-\"".to_string(),
-            "var:world_changed <- true".to_string(),
-            "var:replan_pending <- true".to_string(),
-        ],
-        state,
-    )
+    parse(&format!("{sop}_failed_{name}"), "true", &format!("var:{sop}_sop_state == fatal"), &[], &look_again(&[]), state)
 }
 
 /// What happens when a planned step has waited too long for its precondition:
@@ -169,20 +170,12 @@ pub fn stale_plan_transitions(name: &str, config: &Config, state: &State) -> Vec
     )]
 }
 
-/// A planned operation that runs the transfer SOP once.
+/// A planned operation that runs one SOP once.
 ///
 /// `effects` are what the planner assumes and what the operation records when
-/// the SOP completes; `on_completion` are runtime-only extras, applied after
-/// the effects (so they can correct one with a measurement).
-fn task(
-    name: &str,
-    config: &Config,
-    guard: &str,
-    effects: &[String],
-    transfer: Transfer,
-    on_completion: &[String],
-    state: &State,
-) -> Operation {
+/// the SOP completes; `on_completion` are runtime-only extras.
+fn task(name: &str, config: &Config, guard: &str, effects: &[String], mv: Move, on_completion: &[String], state: &State) -> Operation {
+    let sop = mv.sop();
     Operation::new(
         name,
         Some(PLANNED_STEP_TIMEOUT_MS),
@@ -190,20 +183,27 @@ fn task(
         None,
         None,
         false,
-        vec![parse(&format!("start_{name}"), guard, READY, &[], &start_runner_actions(&transfer), state)],
-        vec![parse(
-            &format!("complete_{name}"),
-            "true",
-            SOP_DONE,
-            effects,
-            &finish_runner_actions(on_completion),
-            state,
-        )],
-        vec![sop_failed(name, TRANSFER_SOP, state)],
+        vec![parse(&format!("start_{name}"), guard, READY, &[], &mv.start_runner_actions(), state)],
+        vec![parse(&format!("complete_{name}"), "true", &sop_done(sop), effects, &finish_runner_actions(on_completion), state)],
+        vec![sop_failed(name, sop, state)],
         stale_plan_transitions(name, config, state),
         vec![],
         vec![],
     )
+}
+
+/// The feeder may be emptied one more die only while no die the order wants is
+/// lying in the arena - those go to a pad or the tower first - or when there is
+/// no pad left to put one on.
+fn fetch_allowed(config: &Config) -> String {
+    let arena_clear = config
+        .dice
+        .iter()
+        .map(|x| format!("(var:{x}_in_arena == false || var:{x}_wanted_face == 0)"))
+        .collect::<Vec<_>>()
+        .join(" && ");
+    let pads_full = (1..=config.pads).map(|j| format!("var:pad_{j} != none")).collect::<Vec<_>>().join(" && ");
+    format!("(({arena_clear}) || ({pads_full}))")
 }
 
 /// Every planned operation for this cell.
@@ -219,104 +219,55 @@ pub fn planned_operations(config: &Config, state: &State) -> Vec<Operation> {
     let on_something = |k: usize| -> String {
         if k > 1 { format!(" && var:level_{} != none", k - 1) } else { String::new() }
     };
+    let fetch_allowed = fetch_allowed(config);
 
     for die in &config.dice {
         let d = die.as_str();
 
-        // --- get the wanted face up: throw it once, then flip it until it shows.
-        let name = format!("get_face_{d}");
-        let needs_face = format!("var:{d}_loose == true && var:{d}_wanted_face != 0 && var:{d}_face != var:{d}_wanted_face");
-        let shows_it = format!("var:{d}_face_measured == var:{d}_wanted_face");
-        let shows_not = format!("var:{d}_face_measured != var:{d}_wanted_face");
-        // What the planner assumes, and what a successful attempt records.
-        let got_it = [format!("var:{d}_face <- var:{d}_wanted_face"), format!("var:{d}_in_arena <- true")];
-        // An attempt that left the wrong face up: record what it did show, put
-        // the skills back to rest, and fail - which retries, with a flip.
-        let try_again = |extra: &[&str]| -> Vec<String> {
-            let mut actions = vec![
-                format!("var:{d}_face <- var:{d}_face_measured"),
-                format!("var:{d}_in_arena <- true"),
-                format!("var:{TRANSFER_SOP}_sop_state <- initial"),
-                format!("var:{FLIP_SOP}_sop_state <- initial"),
-                "var:transfer_busy <- false".to_string(),
-                "var:kpi_current_task <- \"-\"".to_string(),
-            ];
-            actions.extend(extra.iter().map(|a| a.to_string()));
-            actions
+        // --- the next die out of the feeder, hoping it is this one.
+        let name = format!("fetch_{d}");
+        let mv = Move::Transfer {
+            die: UNKNOWN_DIE.to_string(),
+            pick: FEEDER_NEXT_FRAME.to_string(),
+            place: ARENA_DROP_FRAME.to_string(),
+            release: "throw",
+            label: format!("fetch {d}?"),
         };
+        let landed = sop_done(TRANSFER_SOP);
         ops.push(Operation::new(
             &name,
             Some(PLANNED_STEP_TIMEOUT_MS),
             Some(config.stale_step_ms),
-            Some(GET_FACE_RETRIES),
+            None,
             None,
             false,
+            vec![parse(
+                &format!("start_{name}"),
+                &format!("var:{d}_seen == false && var:{d}_wanted_face != 0 && {fetch_allowed}"),
+                READY,
+                &[],
+                &mv.start_runner_actions(),
+                state,
+            )],
+            vec![parse(
+                &format!("complete_{name}"),
+                "true",
+                &format!("{landed} && var:{d}_in_arena_measured == true"),
+                &[format!("var:{d}_seen <- true"), format!("var:{d}_in_arena <- true")],
+                &finish_runner_actions(&["var:kpi_run_throws += 1".to_string()]),
+                state,
+            )],
             vec![
-                // Still in the feeder: its one throw.
+                // The camera says it is another colour: take that in and replan.
                 parse(
-                    &format!("start_throw_{name}"),
-                    &needs_face,
-                    &format!("{READY} && var:{d}_in_arena == false"),
-                    &[],
-                    &start_runner_actions(&Transfer {
-                        die: d.to_string(),
-                        pick: die_frame(d),
-                        pick_transit: transit_frame(&die_frame(d)),
-                        place: ARENA_DROP_FRAME.to_string(),
-                        place_transit: transit_frame(ARENA_DROP_FRAME),
-                        release: "throw",
-                        label: format!("throw {d}"),
-                    }),
-                    state,
-                ),
-                // Already in the arena: a flip.
-                parse(
-                    &format!("start_flip_{name}"),
-                    &needs_face,
-                    &format!("{READY} && var:{d}_in_arena == true"),
-                    &[],
-                    &start_flip_runner_actions(d),
-                    state,
-                ),
-            ],
-            vec![
-                parse(
-                    &format!("complete_throw_{name}"),
+                    &format!("other_colour_{name}"),
                     "true",
-                    &format!("{SOP_DONE} && {shows_it}"),
-                    &got_it,
-                    &finish_runner_actions(&["var:kpi_run_throws += 1".to_string()]),
-                    state,
-                ),
-                parse(
-                    &format!("complete_flip_{name}"),
-                    "true",
-                    &format!("{FLIP_DONE} && {shows_it}"),
-                    &got_it,
-                    &finish_runner_actions(&["var:kpi_run_flips += 1".to_string()]),
-                    state,
-                ),
-            ],
-            vec![
-                parse(
-                    &format!("wrong_face_after_throw_{name}"),
-                    "true",
-                    &format!("{SOP_DONE} && {shows_not}"),
+                    &format!("{landed} && var:{d}_in_arena_measured == false"),
                     &[],
-                    &try_again(&["var:kpi_run_transfers += 1", "var:kpi_run_throws += 1", "var:kpi_run_wrong_faces += 1"]),
-                    state,
-                ),
-                // The face that was underneath takes two flips.
-                parse(
-                    &format!("one_more_flip_{name}"),
-                    "true",
-                    &format!("{FLIP_DONE} && {shows_not}"),
-                    &[],
-                    &try_again(&["var:kpi_run_transfers += 1", "var:kpi_run_flips += 1"]),
+                    &look_again(&["var:kpi_run_transfers += 1", "var:kpi_run_throws += 1", "var:kpi_run_other_colour += 1"]),
                     state,
                 ),
                 sop_failed(&name, TRANSFER_SOP, state),
-                sop_failed(&name, FLIP_SOP, state),
             ],
             stale_plan_transitions(&name, config, state),
             vec![],
@@ -324,94 +275,82 @@ pub fn planned_operations(config: &Config, state: &State) -> Vec<Operation> {
         ));
 
         for k in 1..=levels {
-            // --- stack: loose die, already showing its face, onto level k.
+            // --- from the arena onto level k, turned on the way.
             let name = format!("stack_{d}_on_level_{k}");
             ops.push(task(
                 &name,
                 config,
-                &format!(
-                    "var:{d}_loose == true && var:order_{k} == {d} && var:{d}_face == var:order_{k}_face && var:level_{k} == none{}",
-                    on_something(k)
-                ),
+                &format!("var:{d}_in_arena == true && var:order_{k} == {d} && var:level_{k} == none{}", on_something(k)),
                 &[
                     format!("var:level_{k} <- {d}"),
-                    format!("var:level_{k}_face <- var:{d}_face"),
-                    format!("var:{d}_loose <- false"),
+                    format!("var:level_{k}_face <- var:order_{k}_face"),
                     format!("var:{d}_in_arena <- false"),
                 ],
-                Transfer {
-                    die: d.to_string(),
-                    pick: die_frame(d),
-                    pick_transit: transit_frame(&die_frame(d)),
-                    place: level_frame(k),
-                    place_transit: transit_frame(&level_frame(k)),
-                    release: "place",
-                    label: format!("stack {d} on level {k}"),
-                },
+                Move::Build { die: d.to_string(), place: level_frame(k), label: format!("stack {d} on level {k}") },
                 &[],
                 state,
             ));
 
-            // --- throw off the top of the tower.
+            // --- throw off the top of the tower, into the arena.
             let name = format!("throw_{d}_from_level_{k}");
             ops.push(task(
                 &name,
                 config,
                 &format!("var:level_{k} == {d}{}", is_top(k)),
-                &[
-                    format!("var:level_{k} <- none"),
-                    format!("var:level_{k}_face <- 0"),
-                    format!("var:{d}_loose <- true"),
-                    format!("var:{d}_in_arena <- true"),
-                    // Unknown to the planner; the camera fills it in at runtime.
-                    format!("var:{d}_face <- 0"),
-                ],
-                Transfer {
+                &[format!("var:level_{k} <- none"), format!("var:level_{k}_face <- 0"), format!("var:{d}_in_arena <- true")],
+                Move::Transfer {
                     die: d.to_string(),
                     pick: level_frame(k),
-                    pick_transit: transit_frame(&level_frame(k)),
                     place: ARENA_DROP_FRAME.to_string(),
-                    place_transit: transit_frame(ARENA_DROP_FRAME),
                     release: "throw",
                     label: format!("throw {d} off level {k}"),
                 },
-                &single_throw_runner_actions(d),
+                &["var:kpi_run_throws += 1".to_string()],
                 state,
             ));
         }
 
         for j in 1..=config.pads {
-            // --- throw a parked die.
+            // --- park a die the order wants, but not yet.
+            let name = format!("park_{d}_on_pad_{j}");
+            ops.push(task(
+                &name,
+                config,
+                &format!("var:{d}_in_arena == true && var:{d}_wanted_face != 0 && var:pad_{j} == none"),
+                &[format!("var:pad_{j} <- {d}"), format!("var:{d}_in_arena <- false")],
+                Move::Transfer {
+                    die: d.to_string(),
+                    pick: die_frame(d),
+                    place: pad_frame(j),
+                    release: "place",
+                    label: format!("park {d} on pad {j}"),
+                },
+                &[],
+                state,
+            ));
+
+            // --- clear a pad of a die the order no longer wants.
             let name = format!("throw_{d}_from_pad_{j}");
             ops.push(task(
                 &name,
                 config,
-                &format!("var:pad_{j} == {d}"),
-                &[
-                    format!("var:pad_{j} <- none"),
-                    format!("var:pad_{j}_face <- 0"),
-                    format!("var:{d}_loose <- true"),
-                    format!("var:{d}_in_arena <- true"),
-                    // Unknown to the planner; the camera fills it in at runtime.
-                    format!("var:{d}_face <- 0"),
-                ],
-                Transfer {
+                &format!("var:pad_{j} == {d} && var:{d}_wanted_face == 0"),
+                &[format!("var:pad_{j} <- none"), format!("var:{d}_in_arena <- true")],
+                Move::Transfer {
                     die: d.to_string(),
                     pick: pad_frame(j),
-                    pick_transit: transit_frame(&pad_frame(j)),
                     place: ARENA_DROP_FRAME.to_string(),
-                    place_transit: transit_frame(ARENA_DROP_FRAME),
                     release: "throw",
                     label: format!("throw {d} off pad {j}"),
                 },
-                &single_throw_runner_actions(d),
+                &["var:kpi_run_throws += 1".to_string()],
                 state,
             ));
         }
     }
 
-    // Location-to-location moves don't care which die it is: the die and its
-    // face travel with the variables.
+    // Location-to-location moves don't care which die it is: the die travels
+    // with the variables.
     for k in 1..=levels {
         for j in 1..=config.pads {
             let name = format!("unstack_level_{k}_to_pad_{j}");
@@ -419,18 +358,11 @@ pub fn planned_operations(config: &Config, state: &State) -> Vec<Operation> {
                 &name,
                 config,
                 &format!("var:level_{k} != none{} && var:pad_{j} == none", is_top(k)),
-                &[
-                    format!("var:pad_{j} <- var:level_{k}"),
-                    format!("var:pad_{j}_face <- var:level_{k}_face"),
-                    format!("var:level_{k} <- none"),
-                    format!("var:level_{k}_face <- 0"),
-                ],
-                Transfer {
+                &[format!("var:pad_{j} <- var:level_{k}"), format!("var:level_{k} <- none"), format!("var:level_{k}_face <- 0")],
+                Move::Transfer {
                     die: format!("var:level_{k}"),
                     pick: level_frame(k),
-                    pick_transit: transit_frame(&level_frame(k)),
                     place: pad_frame(j),
-                    place_transit: transit_frame(&pad_frame(j)),
                     release: "place",
                     label: format!("park level {k} on pad {j}"),
                 },
@@ -442,25 +374,13 @@ pub fn planned_operations(config: &Config, state: &State) -> Vec<Operation> {
             ops.push(task(
                 &name,
                 config,
-                &format!(
-                    "var:pad_{j} != none && var:pad_{j} == var:order_{k} && var:pad_{j}_face == var:order_{k}_face && var:level_{k} == none{}",
-                    on_something(k)
-                ),
+                &format!("var:pad_{j} != none && var:pad_{j} == var:order_{k} && var:level_{k} == none{}", on_something(k)),
                 &[
                     format!("var:level_{k} <- var:pad_{j}"),
-                    format!("var:level_{k}_face <- var:pad_{j}_face"),
+                    format!("var:level_{k}_face <- var:order_{k}_face"),
                     format!("var:pad_{j} <- none"),
-                    format!("var:pad_{j}_face <- 0"),
                 ],
-                Transfer {
-                    die: format!("var:pad_{j}"),
-                    pick: pad_frame(j),
-                    pick_transit: transit_frame(&pad_frame(j)),
-                    place: level_frame(k),
-                    place_transit: transit_frame(&level_frame(k)),
-                    release: "place",
-                    label: format!("stack pad {j} on level {k}"),
-                },
+                Move::Build { die: format!("var:pad_{j}"), place: level_frame(k), label: format!("stack pad {j} on level {k}") },
                 &[],
                 state,
             ));

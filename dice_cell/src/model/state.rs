@@ -44,23 +44,20 @@ fn a(state: &mut State, name: &str) {
 }
 
 /// What the control system believes, the order it is working towards, and the
-/// handshakes between the planned operations and the transfer SOP.
+/// handshakes between the planned operations and the SOPs.
 ///
-/// Starts from "every die is loose and its face is unknown": the cell's first
-/// camera reading replaces that within a tick of the cell coming up.
+/// Starts from "no die has been seen": the cell's first camera reading replaces
+/// that within a tick of the cell coming up.
 pub fn belief_and_order_variables(config: &Config) -> State {
     let mut state = State::new();
     for die in &config.dice {
-        // Loose means "not on the tower and not on a pad" - in the feeder or
-        // lying in the arena. The planner does not care which: the robot picks
-        // a die from wherever its frame is.
-        b(&mut state, &format!("{die}_loose"), true);
-        // In the arena rather than the feeder: it has had its one throw, and its
-        // face is changed by flipping it from now on.
+        // Seen: the camera over the arena has read this die's colour, so the
+        // model knows where it is - in the arena, on a pad, on the tower. A die
+        // that has not been seen is in the feeder, but nobody knows which slot:
+        // the feeder has no camera, and its dice all look the same from above.
+        b(&mut state, &format!("{die}_seen"), false);
+        // Lying in the arena, where the camera can see it.
         b(&mut state, &format!("{die}_in_arena"), false);
-        // 0 is "unknown". Only meaningful while the die is loose; on the tower
-        // or a pad the face travels with the location (level_k_face, pad_j_face).
-        i(&mut state, &format!("{die}_face"), 0);
         // What the order wants this die to show, 0 if it is not in the order.
         // Written only by the order handler, together with order_k / order_k_face.
         i(&mut state, &format!("{die}_wanted_face"), 0);
@@ -71,12 +68,13 @@ pub fn belief_and_order_variables(config: &Config) -> State {
         s(&mut state, &format!("order_{k}"), NONE);
         i(&mut state, &format!("order_{k}_face"), 0);
     }
+    // The buffer pads. A die on one keeps how it lies, and the build SOP turns
+    // it on its way to the tower, so the planner only needs to know which die.
     for j in 1..=config.pads {
         s(&mut state, &format!("pad_{j}"), NONE);
-        i(&mut state, &format!("pad_{j}_face"), 0);
     }
 
-    // The parameters a planned operation hands the transfer SOP.
+    // The parameters a planned operation hands the SOPs.
     s(&mut state, "transfer_die", NONE);
     s(&mut state, "transfer_pick", NONE);
     s(&mut state, "transfer_pick_transit", NONE);
@@ -100,7 +98,7 @@ pub fn belief_and_order_variables(config: &Config) -> State {
 
     // KPIs, for the GUI's Production tab (it renders anything named kpi_<group>_<name>).
     i(&mut state, "kpi_run_throws", 0);
-    i(&mut state, "kpi_run_wrong_faces", 0);
+    i(&mut state, "kpi_run_other_colour", 0);
     i(&mut state, "kpi_run_flips", 0);
     i(&mut state, "kpi_run_transfers", 0);
     i(&mut state, "kpi_run_replans", 0);
@@ -113,24 +111,31 @@ pub fn belief_and_order_variables(config: &Config) -> State {
     state
 }
 
-/// What the camera sees. Seeded by the runner so the model can be parsed
+/// What the cell reports. Seeded by the runner so the model can be parsed
 /// against it, but merged *without* overwriting, so a runner restart does not
 /// clobber what a running cell has already published.
+///
+/// The camera looks at the arena only: colour and face of every die lying
+/// there. A die it has seen once stays seen - the cell tracks it to the pads
+/// and the tower - until it goes back into the feeder.
 pub fn measured_variables(config: &Config) -> State {
     let mut state = State::new();
     for die in &config.dice {
-        b(&mut state, &format!("{die}_loose_measured"), true);
+        b(&mut state, &format!("{die}_seen_measured"), false);
         b(&mut state, &format!("{die}_in_arena_measured"), false);
+        // 0 unless the die is in the arena, where the camera can read it.
         i(&mut state, &format!("{die}_face_measured"), 0);
     }
+    i(&mut state, "feeder_count_measured", 0);
     for k in 1..=config.levels() {
         s(&mut state, &format!("level_{k}_measured"), NONE);
         i(&mut state, &format!("level_{k}_face_measured"), 0);
     }
     for j in 1..=config.pads {
         s(&mut state, &format!("pad_{j}_measured"), NONE);
-        i(&mut state, &format!("pad_{j}_face_measured"), 0);
     }
+    // Raised by the cell once it has published the dice.
+    b(&mut state, "cell_online", false);
     s(&mut state, "disturbance", "");
     s(&mut state, "disturbance_status", "write a disturbance here: knock_tower, steal_top, steal <colour>, bump <colour>, reset");
     s(&mut state, "gripper_holding", NONE);
@@ -145,6 +150,9 @@ pub fn gripper_variables() -> State {
     s(&mut state, "gripper_command", NONE);
     s(&mut state, "gripper_die", NONE);
     s(&mut state, "gripper_target", NONE);
+    // Set by `look` and by a `place` on the flip station: the die does not show
+    // its wanted face yet. Steers the build SOP's flips.
+    b(&mut state, "gripper_flip_needed", false);
     s_unknown(&mut state, "gripper_result");
     state
 }

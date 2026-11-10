@@ -3,8 +3,8 @@
 //! | Part | Kind | Where |
 //! |---|---|---|
 //! | Transfer one die (travel, descend, grip, lift, travel, descend, release) | SOP | skills.rs |
-//! | Flip one die a quarter at the flip station | SOP | skills.rs |
-//! | Get a face up / stack / unstack / park / throw off | planned operations | tasks.rs |
+//! | Build: turn one die at the flip station as needed, then stack it | SOP | skills.rs |
+//! | Fetch from the feeder / stack / park / unstack / throw off | planned operations | tasks.rs |
 //! | Re-read the cell when it changed behind the plan's back | automatic transitions | reactions.rs |
 //! | "The tower is the order" | goal | goal.rs |
 
@@ -28,7 +28,7 @@ pub fn build_model(config: &Config, state: &State) -> (Model, State) {
     state.extend_mut(state::robot_variables(&config.robot_id), false);
     state.extend_mut(state::gripper_variables(), true);
 
-    let sops = vec![skills::transfer_sop(config, &state), skills::flip_sop(config, &state)];
+    let sops = vec![skills::transfer_sop(config, &state), skills::build_sop(config, &state)];
     state.extend_mut(generate_multi_sop_state_variables(&sops, "dice_model"), true);
 
     let operations = tasks::planned_operations(config, &state);

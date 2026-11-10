@@ -2,8 +2,9 @@
 //!
 //! The planner reasons over the belief variables. When something the model did
 //! not do changes the cell - an operator knocks the tower over, takes a die
-//! away, a die lands somewhere other than where it was put - the `cell` binary
-//! updates what the camera sees and raises `world_changed`. These transitions
+//! away, a die lands somewhere other than where it was put, the die the robot
+//! took out of the feeder turns out to be another colour than the plan hoped -
+//! the `cell` binary updates what it reports and `world_changed` is raised. These transitions
 //! then copy the camera's picture into the belief, and make sure the plan made
 //! for the old picture is not continued:
 //!
@@ -34,9 +35,8 @@ fn parse(name: &str, guard: &str, actions: &[String], state: &State) -> Transiti
 fn copy_measured(config: &Config) -> Vec<String> {
     let mut actions = vec!["var:world_changed <- false".to_string()];
     for d in &config.dice {
-        actions.push(format!("var:{d}_loose <- var:{d}_loose_measured"));
+        actions.push(format!("var:{d}_seen <- var:{d}_seen_measured"));
         actions.push(format!("var:{d}_in_arena <- var:{d}_in_arena_measured"));
-        actions.push(format!("var:{d}_face <- var:{d}_face_measured"));
     }
     for k in 1..=config.levels() {
         actions.push(format!("var:level_{k} <- var:level_{k}_measured"));
@@ -44,7 +44,6 @@ fn copy_measured(config: &Config) -> Vec<String> {
     }
     for j in 1..=config.pads {
         actions.push(format!("var:pad_{j} <- var:pad_{j}_measured"));
-        actions.push(format!("var:pad_{j}_face <- var:pad_{j}_face_measured"));
     }
     actions
 }

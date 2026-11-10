@@ -2,8 +2,13 @@
 //!
 //! The control system never reads this. It sees the cell through two windows,
 //! both written from here: the transform tree (which RViz draws, and which the
-//! robot's IK looks up) and the `*_measured` variables, which stand in for a
-//! camera that reads every die's position and top face.
+//! robot's IK looks up) and the `*_measured` variables.
+//!
+//! The only camera looks at the arena. A die in the feeder is just "a die": the
+//! cell knows its colour, the control system does not, and it is drawn the way
+//! the control system knows it - grey, without pips - until it has landed in the
+//! arena once. From then on it is tracked wherever the robot takes it, and drawn
+//! in its colours, until it is put back in the feeder.
 
 use micro_sp::*;
 use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
@@ -38,6 +43,9 @@ pub struct Die {
     /// sides - which is what a flip needs to know. In the gripper it is relative
     /// to the TCP.
     pub body: UnitQuaternion<f64>,
+    /// The camera has read it: it has landed in the arena since it last left
+    /// the feeder.
+    pub seen: bool,
 }
 
 impl Die {
@@ -68,6 +76,7 @@ impl World {
                 loc: Loc::Feeder(slot),
                 yaw: rng.gen_range(-0.15..0.15),
                 body: aligned_rotations()[rng.gen_range(0..24)],
+                seen: false,
             })
             .collect();
         World { config, dice, rng }
@@ -91,6 +100,15 @@ impl World {
 
     pub fn on_station(&self) -> Option<&Die> {
         self.dice.iter().find(|d| d.loc == Loc::Station)
+    }
+
+    /// The die in the lowest occupied feeder slot - the next one to take.
+    pub fn next_in_feeder(&self) -> Option<&Die> {
+        self.dice
+            .iter()
+            .filter_map(|d| if let Loc::Feeder(s) = d.loc { Some((s, d)) } else { None })
+            .min_by_key(|(s, _)| *s)
+            .map(|(_, d)| d)
     }
 
     pub fn holding(&self) -> Option<&Die> {
@@ -138,31 +156,6 @@ impl World {
         best
     }
 
-    /// The free spot on the arena floor nearest `(x, y)` (arena coordinates), so
-    /// a flipped die does not travel further than it has to.
-    pub fn free_arena_spot_near(&self, target: (f64, f64)) -> (f64, f64) {
-        let reach = ARENA_INNER_HALF - ARENA_MARGIN;
-        let steps = 12;
-        let mut best: Option<((f64, f64), f64)> = None;
-        let mut roomiest = ((0.0, 0.0), f64::MIN);
-        for i in 0..=steps {
-            for j in 0..=steps {
-                let candidate = (-reach + 2.0 * reach * i as f64 / steps as f64, -reach + 2.0 * reach * j as f64 / steps as f64);
-                let clearance = self.arena_clearance(candidate);
-                if clearance > roomiest.1 {
-                    roomiest = (candidate, clearance);
-                }
-                if clearance > ARENA_SPACING {
-                    let distance = ((candidate.0 - target.0).powi(2) + (candidate.1 - target.1).powi(2)).sqrt();
-                    if best.is_none_or(|(_, d)| distance < d) {
-                        best = Some((candidate, distance));
-                    }
-                }
-            }
-        }
-        best.map(|(c, _)| c).unwrap_or(roomiest.0)
-    }
-
     /// How a thrown die lands: any of the 24 square orientations.
     pub fn random_body(&mut self) -> UnitQuaternion<f64> {
         aligned_rotations()[self.rng.gen_range(0..24)]
@@ -182,25 +175,28 @@ impl World {
             state.add_mut(SPAssignment::new(SPVariable::new(&name, value.has_type()), value), "cell");
         };
         for die in &self.dice {
-            // The flip station stands by the arena, and a die is only ever on it
-            // during a flip: as far as the model is concerned it is in the arena.
-            let in_arena = matches!(die.loc, Loc::Arena(..) | Loc::Station);
-            let loose = in_arena || matches!(die.loc, Loc::Feeder(_));
-            put(format!("{}_loose_measured", die.name), loose.to_spvalue());
+            let in_arena = matches!(die.loc, Loc::Arena(..));
+            put(format!("{}_seen_measured", die.name), die.seen.to_spvalue());
             put(format!("{}_in_arena_measured", die.name), in_arena.to_spvalue());
-            put(format!("{}_face_measured", die.name), die.face().to_spvalue());
+            put(format!("{}_face_measured", die.name), (if in_arena { die.face() } else { 0 }).to_spvalue());
         }
+        // The feeder can tell how many dice it holds - not which.
+        let in_feeder = self.dice.iter().filter(|d| matches!(d.loc, Loc::Feeder(_))).count() as i64;
+        put("feeder_count_measured".to_string(), in_feeder.to_spvalue());
         for k in 1..=self.config.levels() {
             let (name, face) = self.at_level(k).map(|d| (d.name.clone(), d.face())).unwrap_or((NONE.to_string(), 0));
             put(format!("level_{k}_measured"), name.to_spvalue());
             put(format!("level_{k}_face_measured"), face.to_spvalue());
         }
         for j in 1..=self.config.pads {
-            let (name, face) = self.at_pad(j).map(|d| (d.name.clone(), d.face())).unwrap_or((NONE.to_string(), 0));
+            let name = self.at_pad(j).map(|d| d.name.clone()).unwrap_or(NONE.to_string());
             put(format!("pad_{j}_measured"), name.to_spvalue());
-            put(format!("pad_{j}_face_measured"), face.to_spvalue());
         }
-        let holding = self.holding().map(|d| d.name.clone()).unwrap_or(NONE.to_string());
+        let holding = match self.holding() {
+            Some(d) if d.seen => d.name.clone(),
+            Some(_) => UNKNOWN_DIE.to_string(),
+            None => NONE.to_string(),
+        };
         put("gripper_holding".to_string(), holding.to_spvalue());
         state
     }
@@ -226,23 +222,31 @@ impl World {
     }
 
     pub fn body_frame(&self, die: &Die, rotation: UnitQuaternion<f64>) -> SPTransformStamped {
-        let colour = die_colour(&die.name).map(|c| c.rgb).unwrap_or([0.8, 0.8, 0.8]);
+        let colour = match die_colour(&die.name) {
+            Some(c) if die.seen => c.rgb,
+            _ => UNSEEN_GREY,
+        };
         stamped(
             &die_body_frame(&die.name),
             &die_frame(&die.name),
             iso(Vector3::zeros(), rotation),
-            mesh_metadata("die_body.stl", colour),
+            mesh_metadata("die_body.stl", colour, MESH_SCALE),
             true,
         )
     }
 
+    /// The pips. An unseen die has none to show: they are shrunk to nothing
+    /// inside the body rather than removed, so the marker stays the same one.
     pub fn pips_frame(&self, die: &Die) -> SPTransformStamped {
-        let colour = die_colour(&die.name).map(|c| c.pips).unwrap_or([0.0, 0.0, 0.0]);
+        let (colour, scale) = match die_colour(&die.name) {
+            Some(c) if die.seen => (c.pips, MESH_SCALE),
+            _ => (UNSEEN_GREY, MESH_SCALE * 0.01),
+        };
         stamped(
             &die_pips_frame(&die.name),
             &die_body_frame(&die.name),
             Isometry3::identity(),
-            mesh_metadata("die_pips.stl", colour),
+            mesh_metadata("die_pips.stl", colour, scale),
             false,
         )
     }
@@ -272,12 +276,15 @@ pub fn stamped(child: &str, parent: &str, iso: Isometry3<f64>, metadata: MapOrUn
     }
 }
 
-pub fn mesh_metadata(mesh: &str, rgb: [f64; 3]) -> MapOrUnknown {
+/// The dice meshes are in millimetres.
+const MESH_SCALE: f64 = 0.001;
+
+pub fn mesh_metadata(mesh: &str, rgb: [f64; 3], scale: f64) -> MapOrUnknown {
     MapOrUnknown::Map(vec![
         ("visualize_mesh".to_spvalue(), true.to_spvalue()),
         ("mesh_type".to_spvalue(), 10i64.to_spvalue()),
         ("mesh_file".to_spvalue(), mesh.to_spvalue()),
-        ("mesh_scale".to_spvalue(), 0.001.to_spvalue()),
+        ("mesh_scale".to_spvalue(), scale.to_spvalue()),
         ("mesh_r".to_spvalue(), rgb[0].to_spvalue()),
         ("mesh_g".to_spvalue(), rgb[1].to_spvalue()),
         ("mesh_b".to_spvalue(), rgb[2].to_spvalue()),

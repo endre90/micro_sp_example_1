@@ -1,19 +1,22 @@
 //! A dice-stacking cell for micro_sp.
 //!
-//! A UR5 builds a tower of coloured dice. Each die has to show a given face. A
-//! die from the feeder is thrown into the arena once, and from then on its face
-//! is changed by flipping it onto its side at the flip station. An *order* says which colour goes on which level and which
-//! face it shows; the planner works out the rest from whatever the cell looks
-//! like right now - dice in the feeder, dice already lying in the arena with the
-//! right face up, a half-built tower that is wrong at level two.
+//! A UR5 builds a tower of coloured dice. Each die has to show a given face. An
+//! *order* says which colour goes on which level and which face it shows. The
+//! dice come out of a blind feeder - nobody knows which die is in which slot -
+//! and are thrown into the arena, where a camera reads their colour and face.
+//! A die going onto the tower is turned at the flip station on the way, if it
+//! needs to be; one that came out before its turn waits on a buffer pad. The
+//! planner works out the rest from whatever the cell looks like right now -
+//! dice not seen yet, dice lying in the arena, a half-built tower that is wrong
+//! at level two.
 //!
 //! Two binaries share this crate:
 //!
 //! * `runner` - the control system. Builds the model, seeds the state, runs
 //!   micro_sp, and turns an order into a goal.
 //! * `cell` - everything physical that is not the robot: the dice, the gripper,
-//!   the camera that reads the faces, and the disturbances an operator can
-//!   inject (knock the tower over, take a die away, ...).
+//!   the feeder, the camera over the arena, and the disturbances an operator
+//!   can inject (knock the tower over, take a die away, ...).
 //!
 //! The robot itself is `simple_robot_simulator`, a separate process.
 
