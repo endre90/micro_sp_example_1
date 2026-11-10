@@ -1,0 +1,16 @@
+**/target/
+**/*.rs.bk
+
+# cloned and written by the native launchers
+native_deps/
+run/sim_native/logs/
+# written by the dockerized stack at runtime
+run/sim_docker/logs/
+**/micro_sp_logs
+
+# the GUI's Transforms tab exports here; move a frame up into scenario/ on purpose
+shared_folder/scenario/exported/
+
+**/__pycache__/
+.DS_Store
+*.vscode

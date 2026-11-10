@@ -1,0 +1,29 @@
+{
+    "child_frame_id": "feeder",
+    "parent_frame_id": "world",
+    "transform": {
+        "translation": {
+            "x": 0.35,
+            "y": -0.38,
+            "z": 0.0
+        },
+        "rotation": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "w": 1.0
+        }
+    },
+    "metadata": {
+        "enable_transform": true,
+        "active_transform": false,
+        "visualize_mesh": true,
+        "mesh_type": 10,
+        "mesh_file": "feeder.stl",
+        "mesh_scale": 0.001,
+        "mesh_r": 0.62,
+        "mesh_g": 0.64,
+        "mesh_b": 0.68,
+        "mesh_a": 1.0
+    }
+}

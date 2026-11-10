@@ -1,0 +1,21 @@
+{
+    "child_frame_id": "level_3_transit",
+    "parent_frame_id": "world",
+    "transform": {
+        "translation": {
+            "x": 0.22,
+            "y": 0.32,
+            "z": 0.34
+        },
+        "rotation": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "w": 1.0
+        }
+    },
+    "metadata": {
+        "enable_transform": true,
+        "active_transform": false
+    }
+}

@@ -1,0 +1,21 @@
+{
+    "child_frame_id": "pad_3",
+    "parent_frame_id": "pad_3_plate",
+    "transform": {
+        "translation": {
+            "x": 0,
+            "y": 0,
+            "z": 0.03
+        },
+        "rotation": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "w": 1.0
+        }
+    },
+    "metadata": {
+        "enable_transform": true,
+        "active_transform": false
+    }
+}

@@ -1,0 +1,21 @@
+{
+    "child_frame_id": "flip_station_tilt_above",
+    "parent_frame_id": "world",
+    "transform": {
+        "translation": {
+            "x": 0.42,
+            "y": -0.24,
+            "z": 0.3
+        },
+        "rotation": {
+            "w": 0.35491585680382265,
+            "x": 0.3549158568038226,
+            "y": -0.6115837919608468,
+            "z": -0.6115837919608469
+        }
+    },
+    "metadata": {
+        "enable_transform": true,
+        "active_transform": false
+    }
+}

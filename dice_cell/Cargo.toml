@@ -1,0 +1,26 @@
+[package]
+name = "dice_cell"
+version = "0.1.0"
+authors = ["Endre Erős <endre.eros@chalmersindustriteknik.se>"]
+edition = "2024"
+description = "A dice-stacking cell that shows where goal-based planning beats hand-written sequences."
+
+[dependencies]
+log = "0.4.22"
+tokio = { version = "1", features = ["full"] }
+serde_json = "1.0.127"
+ordered-float = { version = "3.4.0", features = ["serde"] }
+# The same version micro_sp builds against, so `Isometry3` is one type.
+nalgebra = "0.32.5"
+rand = { version = "0.8.5", features = ["small_rng"] }
+# The tag simple_robot_simulator is on. Declared over ssh like every other
+# crate in the stack; the launchers rewrite it to https for their own builds.
+micro_sp = { git = "ssh://git@github.com/endre90/micro_sp.git", tag = "v0.6.1" }
+
+[[bin]]
+name = "runner"
+path = "src/bin/runner.rs"
+
+[[bin]]
+name = "cell"
+path = "src/bin/cell.rs"

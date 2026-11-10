@@ -1,0 +1,30 @@
+# Hardware-accelerated rendering for the RViz container.
+#
+# Layered on top of docker-compose.yaml only when the host actually has a DRM
+# render node; run_in_docker.sh detects that and fills in both variables:
+#
+#   docker compose -f docker-compose.yaml -f docker-compose.gpu.yaml up
+#
+# This lives in a separate file on purpose. A `devices:` entry pointing at a
+# missing /dev/dri makes `docker compose up` fail outright, which would break
+# every client not on a Linux host - and those clients are exactly why the RViz
+# view is served over the browser in the first place. Without this override the
+# stack still runs, just on Mesa's software rasterizer.
+#
+# DRI_RENDER_NODE is mapped to a fixed path inside the container so the guest
+# does not depend on the host's numbering.
+
+services:
+  rviz:
+    devices:
+      - "${DRI_RENDER_NODE:-/dev/dri/renderD128}:/dev/dri/renderD128"
+    # The render node is owned by a group (typically `render`) whose GID differs
+    # between hosts, hence the detected value rather than a hardcoded one.
+    #
+    # This is insurance, not load-bearing: the image runs as root today, and root
+    # bypasses the device's group permissions anyway (verified - hardware GL works
+    # without this). It matters only if the image is ever changed to run as a
+    # non-root user, where without the right GID the device is present but
+    # unreadable and Mesa silently falls back to llvmpipe instead of failing.
+    group_add:
+      - "${RENDER_GID:-990}"

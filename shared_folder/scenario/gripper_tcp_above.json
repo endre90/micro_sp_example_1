@@ -1,0 +1,21 @@
+{
+    "child_frame_id": "gripper_tcp_above",
+    "parent_frame_id": "tool0",
+    "transform": {
+        "translation": {
+            "x": 0,
+            "y": 0,
+            "z": 0.225
+        },
+        "rotation": {
+            "x": 1.0,
+            "y": 0.0,
+            "z": 0.0,
+            "w": 0.0
+        }
+    },
+    "metadata": {
+        "enable_transform": true,
+        "active_transform": false
+    }
+}

@@ -1,0 +1,21 @@
+{
+    "child_frame_id": "feeder_slot_1",
+    "parent_frame_id": "world",
+    "transform": {
+        "translation": {
+            "x": 0.2,
+            "y": -0.38,
+            "z": 0.03
+        },
+        "rotation": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.7071067811865475,
+            "w": 0.7071067811865476
+        }
+    },
+    "metadata": {
+        "enable_transform": true,
+        "active_transform": false
+    }
+}

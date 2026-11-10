@@ -1,0 +1,195 @@
+name: dice-cell-sim-docker
+
+# The same stack as ../sim_native/run_natively.sh, every piece in a container,
+# so a machine only needs Docker and this repository.
+#
+#   Redis                  redis
+#   micro_sp GUI           micro_sp_gui      -> http://localhost:8080
+#   UR5 (kinematic sim)    robot
+#   Redis -> ROS bridge    viz
+#   RViz2                  rviz              -> http://localhost:6081
+#   Model runner           runner
+#   Simulated cell         cell
+#
+# Paths that end up in ROS markers as file:// URIs have to resolve to the same
+# absolute path in the publisher (viz) and in the viewer (rviz). That is what
+# /opt/shared/{meshes,scenario,ur_description} are for - keep them identical
+# across services.
+
+x-redis-env: &redis-env
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+
+x-ros-env: &ros-env
+  ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-0}"
+  ROS_AUTOMATIC_DISCOVERY_RANGE: SUBNET
+  RMW_IMPLEMENTATION: "${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
+
+x-dice-build: &dice-build
+  context: ../..
+  dockerfile: docker/dice_cell/docker/Dockerfile
+
+x-dice-env: &dice-env
+  SP_INSTANCE_ID: "${SP_INSTANCE_ID:-sp1}"
+  ROBOT_ID: "${ROBOT_ID:-r1}"
+  N_DICE: "${N_DICE:-6}"
+  N_PADS: "${N_PADS:-3}"
+  ROBOT_SPEED: "${ROBOT_SPEED:-30.0}"
+  STALE_STEP_MS: "${STALE_STEP_MS:-1000}"
+  SCENARIO_DIR: /opt/shared/scenario
+  MICRO_SP_ACTIVITY_LOG: "1"
+  MICRO_SP_ACTIVITY_LOG_DIR: /logs/micro_sp_logs
+  RUST_LOG: "${RUST_LOG:-info}"
+
+services:
+  # The /tmp/runner_ready.flag handshake lives in a named volume that survives
+  # `docker compose down`; a stale flag would let the cell start too early.
+  init_flags:
+    image: busybox:1.38
+    container_name: init_flags_dice_docker
+    restart: "no"
+    command: sh -c 'rm -f /flags/runner_ready.flag; echo "Cleared stale ready flags."'
+    volumes:
+      - ready_flags:/flags
+
+  redis:
+    image: redis:8.10
+    container_name: redis_dice_docker
+    ports:
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  micro_sp_gui:
+    build:
+      context: ../../docker/micro_sp_gui/docker
+      args:
+        MICRO_SP_GUI_GIT_REF: "${MICRO_SP_GUI_GIT_REF:-master}"
+    container_name: micro_sp_gui_dice_docker
+    ports:
+      - "${MICRO_SP_GUI_HOST_PORT:-8080}:8080"
+    environment:
+      <<: *redis-env
+      SP_ID: "${SP_INSTANCE_ID:-sp1}"
+      ROBOT_ID: "${ROBOT_ID:-r1}"
+      MICRO_SP_ACTIVITY_LOG_DIR: /logs/micro_sp_logs
+      MICRO_SP_GUI_FRAMES_DIR: /opt/shared/scenario/exported
+      RUST_LOG: "${RUST_LOG:-info}"
+    volumes:
+      - ./logs:/logs:ro
+      - ../../shared_folder/scenario:/opt/shared/scenario
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  robot:
+    build:
+      context: ../../docker/simple_robot_simulator/docker
+      args:
+        SIM_GIT_REF: "${SIM_GIT_REF:-master}"
+        UR_REDIS_DRIVER_GIT_REF: "${UR_REDIS_DRIVER_GIT_REF:-v0.3.1}"
+    image: dice-cell/simple_robot_simulator:local
+    container_name: robot_dice_docker
+    environment:
+      <<: *redis-env
+      ROBOT_ID: "${ROBOT_ID:-r1}"
+      ROBOT_MODEL: "${ROBOT_MODEL:-ur5}"
+      DESCRIPTION_DIR: /opt/shared/ur_description
+      INITIAL_JOINT_STATE: "${INITIAL_JOINT_STATE:-0,-1.5708,1.5708,-1.5708,-1.5708,0}"
+      RUST_LOG: "${RUST_LOG:-info}"
+    volumes:
+      # Seeded from the image on first use; RViz reads the same volume.
+      - ur_description:/opt/shared/ur_description
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  viz:
+    build:
+      context: ../../docker/r2r_redis_visualization/docker
+      args:
+        ROS_DISTRO: "${ROS_DISTRO:-lyrical}"
+        VIZ_GIT_REF: "${VIZ_GIT_REF:-v0.4.0}"
+    container_name: viz_dice_docker
+    environment:
+      <<: [*redis-env, *ros-env]
+      MESHES_DIR: /opt/shared/meshes
+      SCENARIO_DIR: /opt/shared/scenario
+      RUST_LOG: "${RUST_LOG:-info}"
+    volumes:
+      - ../../shared_folder/meshes:/opt/shared/meshes:ro
+      - ../../shared_folder/scenario:/opt/shared/scenario:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  rviz:
+    build:
+      context: ../../docker/rviz/docker
+      args:
+        ROS_DISTRO: "${ROS_DISTRO:-lyrical}"
+    container_name: rviz_dice_docker
+    ports:
+      - "${RVIZ_HOST_PORT:-6081}:6080"
+    environment:
+      <<: *ros-env
+      RVIZ_CONFIG: /opt/rviz/default.rviz
+      NOVNC_HOST_PORT: "${RVIZ_HOST_PORT:-6081}"
+      SCREEN_GEOMETRY: "${SCREEN_GEOMETRY:-1600x900}"
+      SCREEN_DEPTH: "${SCREEN_DEPTH:-24}"
+      LIBGL_ALWAYS_SOFTWARE: "${LIBGL_ALWAYS_SOFTWARE:-}"
+    volumes:
+      - ./rviz/default.rviz:/opt/rviz/default.rviz:ro
+      - ../../shared_folder/meshes:/opt/shared/meshes:ro
+      - ur_description:/opt/shared/ur_description:ro
+    depends_on:
+      - viz
+      - robot
+
+  runner:
+    build: *dice-build
+    image: dice-cell/dice_cell:local
+    container_name: runner_dice_docker
+    environment:
+      <<: [*redis-env, *dice-env]
+      INITIAL_ORDER: "${INITIAL_ORDER:-}"
+    volumes:
+      - ready_flags:/tmp
+      - ./logs:/logs
+    depends_on:
+      init_flags:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      robot:
+        condition: service_started
+    command: ["runner"]
+
+  cell:
+    build: *dice-build
+    image: dice-cell/dice_cell:local
+    container_name: cell_dice_docker
+    environment:
+      <<: [*redis-env, *dice-env]
+      CELL_SEED: "${CELL_SEED:-}"
+    volumes:
+      - ready_flags:/tmp
+      - ../../shared_folder/scenario:/opt/shared/scenario:ro
+    depends_on:
+      runner:
+        condition: service_started
+    command:
+      - /bin/sh
+      - -c
+      - |
+        echo 'Waiting for the runner to seed the model state...'
+        while [ ! -f /tmp/runner_ready.flag ]; do sleep 1; done
+        echo 'Runner is up.'
+        exec cell
+
+volumes:
+  ready_flags:
+  ur_description:

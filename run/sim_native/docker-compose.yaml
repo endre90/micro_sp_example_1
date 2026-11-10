@@ -1,0 +1,18 @@
+# The one container the native run still uses: Redis. Everything else is built
+# and run from disk by run_natively.sh.
+#
+# The project name is explicit so `docker compose down --remove-orphans` here can
+# never reap another repository's `sim_native` containers.
+name: dice-cell-sim-native
+
+services:
+  redis:
+    image: redis:8.10
+    container_name: redis_dice_native
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
